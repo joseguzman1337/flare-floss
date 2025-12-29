@@ -1,120 +1,76 @@
-[![Appveyor Build Status](https://ci.appveyor.com/api/projects/status/github/fireeye/flare-floss?branch=master&svg=true)](https://ci.appveyor.com/project/williballenthin/flare-floss)
-[![Travis Build Status](https://travis-ci.org/fireeye/flare-floss.svg?branch=master)](https://travis-ci.org/fireeye/flare-floss)
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/flare-floss)
+[![Last release](https://img.shields.io/github/v/release/mandiant/flare-floss)](https://github.com/mandiant/flare-floss/releases)
+[![CI status](https://github.com/mandiant/flare-floss/actions/workflows/tests.yml/badge.svg)](https://github.com/mandiant/flare-floss/actions/workflows/tests.yml)
+[![Downloads](https://img.shields.io/github/downloads/mandiant/flare-floss/total)](https://github.com/mandiant/flare-floss/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE.txt)
 
+![FLOSS logo](https://github.com/mandiant/flare-floss/blob/master/resources/floss-logo.png)
 
-<img src="resources/logo.png?raw=true " width="350"/>
+# FLARE Obfuscated String Solver
 
-# FireEye Labs Obfuscated String Solver
+The FLARE Obfuscated String Solver (FLOSS, formerly FireEye Labs Obfuscated String Solver) uses advanced
+static analysis techniques to automatically extract and deobfuscate all strings from
+malware binaries. You can use it just like `strings.exe` to enhance the
+basic static analysis of unknown binaries.
+
+### Obfuscated Strings
 
 Rather than heavily protecting backdoors with hardcore packers, many
 malware authors evade heuristic detections by obfuscating only key
 portions of an executable. Often, these portions are strings and resources
 used to configure domains, files, and other artifacts of an infection.
-These key features will not show up as plaintext in output of the `strings.exe` utility
+These key features will not show up as plaintext in the output of the `strings.exe` utility
 that we commonly use during basic static analysis.
 
-The FireEye Labs Obfuscated String Solver (FLOSS) uses advanced
-static analysis techniques to automatically deobfuscate strings from
-malware binaries. You can use it just like `strings.exe` to enhance
-basic static analysis of unknown binaries.
+FLOSS extracts all the following string types:
+1. static strings: "regular" ASCII and UTF-16LE strings
+2. stack strings: strings constructed on the stack at run-time
+3. tight strings: a special form of stack strings, decoded on the stack
+4. decoded strings: strings decoded in a function
 
 Please review the theory behind FLOSS [here](doc/theory.md).
 
+Our [blog post](https://www.mandiant.com/resources/automatically-extracting-obfuscated-strings) talks more about the motivation behind FLOSS and details how the tool works.
 
-## Quick Run
-To try FLOSS right away, download a standalone executable file from the releases page:
-https://github.com/fireeye/flare-floss/releases
+FLOSS version 2.0 updates are detailed in this [blog post](https://www.mandiant.com/resources/floss-version-2).
 
-For a detailed description of *installing* FLOSS, review the documention
- [here](doc/installation.md).
+### Language-specific Strings
+Not all compilers use string formats that the classic `strings.exe` algorithm supports. For example, if strings are UTF-8 encoded or stored without a NULL-terminator. FLOSS can identify and extract strings from programs compiled from the following languages:
+ 1. Go
+ 2. Rust
 
-Standalone nightly builds:
-  - Windows 64bit: [here](http://s3.amazonaws.com/build-artifacts.floss.flare.fireeye.com/appveyor/dist/floss64.exe) 
-  - Windows 32bit: [here](http://s3.amazonaws.com/build-artifacts.floss.flare.fireeye.com/appveyor/dist/floss32.exe)
-  - Linux: [here](https://s3.amazonaws.com/build-artifacts.floss.flare.fireeye.com/travis/linux/dist/floss)
-  - OSX: [here](https://s3.amazonaws.com/build-artifacts.floss.flare.fireeye.com/travis/osx/dist/floss)
+The strings FLOSS extracts specific to a compiler are much easier to inspect by humans. 
 
+Please consult the documentation to learn more about the [language-specific string extraction](doc/language_specific_strings.md).
 
-## Usage
+## Installation
+To use FLOSS, download a standalone executable file from the releases page:
+https://github.com/mandiant/flare-floss/releases
+
+See the [installation documentation](doc/installation.md) for a detailed description of all methods to install FLOSS.
+
+## Usage Examples
 Extract obfuscated strings from a malware binary:
 
-    $ floss /path/to/malware/binary
+    $ floss malware.exe
 
-Display the help/usage screen to see all available switches.
+Only extract stack and tight strings:
 
-    $ ./floss -h
+    $ floss --only stack tight -- suspicious.exe
 
-For a detailed description of *using* FLOSS, review the documention
+Do not extract static strings:
+
+    $ floss --no static -- backdoor.exe
+
+Display the help/usage screens:
+
+    $ floss -h  # show core arguments
+    $ floss -H  # show all supported arguments
+
+For a detailed description of using FLOSS, review the documentation
  [here](doc/usage.md).
 
-For a detailed description of *testing* FLOSS, review the documention
- [here](doc/test.md).
-
-## Sample Output
-
-```
-$ floss malware.bin
-FLOSS static ASCII strings
-!This program cannot be run in DOS mode.
-_YY
-RichYY
-MdfQ
-.text
-`.rdata
-@.data
-.idata
-.didat
-.reloc
-U  F
-?;}
-A@;E
-_^[
-HttHt-H
-'9U
-WS2_32.dll
-FreeLibrary
-GetProcAddress
-LoadLibraryA
-GetModuleHandleA
-GetVersionExA
-MultiByteToWideChar
-WideCharToMultiByte
-Sleep
-GetLastError
-DeleteFileA
-WriteFile
-[..snip...]
-
-FLOSS static UTF-16 strings
-,%d
-
-FLOSS decoded 4 strings
-WinSta0\Default
-Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings
-ProxyEnable
-ProxyServer
-
-FLOSS extracted 81 stack strings
-WinSta0\Default
-'%s' executed.
-ERR '%s' error[%d].
-Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings
-ProxyEnable
-ProxyServer
-wininet.dll
-InternetOpenA
-0\A4
-InternetSetOptionA
-InternetConnectA
-InternetQueryOptionA
-Mozilla/4.0 (compatible; MSIE 7.0; Win32)
--ERR
-FILE(%s) wrote(%d).
-Invalid ojbect.
-SetFilepoint error[%d].
-b64_ntop error[%d].
-GetFileSize error[%d].
-Creates file error[%d].
-KCeID5Y/96QTJc1pzi0ZhEBqVG83OnXaL+oxsRdymHS4bFgl7UrWfP2v=wtjNukM
-[..snip...]
-```
+## Scripts
+FLOSS also contains additional Python scripts in the [scripts](scripts) directory 
+which can be used to load its output into other tools such as Binary Ninja or IDA Pro.
+For detailed description of these scripts review the documentation [here](scripts/README.md).

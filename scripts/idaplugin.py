@@ -1,165 +1,166 @@
-#!/usr/bin/env python2
-'''
+# Copyright 2017 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+#!/usr/bin/env python3
+"""
 Run FLOSS to automatically extract obfuscated strings and apply them to the
 currently loaded module in IDA Pro.
 
 author: Willi Ballenthin
 email: willi.ballenthin@gmail.com
-'''
+"""
+import os
 import time
 import logging
+from typing import List, Union
+from pathlib import Path
 
+import idc
 import viv_utils
 
 import floss
 import floss.main
+import floss.utils
+import floss.render
+import floss.identify
 import floss.stackstrings
-import floss.decoding_manager
-import floss.identification_manager
+import floss.tightstrings
+import floss.string_decoder
+from floss.results import AddressType, StackString, TightString, DecodedString
 
-import idc
-
-
-logger = logging.getLogger('floss.idaplugin')
+logger = logging.getLogger("floss.idaplugin")
 
 
 MIN_LENGTH = 4
 
 
-def append_comment(ea, s, repeatable=False):
-    '''
+def append_comment(ea: int, s: str, repeatable: bool = False) -> None:
+    """
     add the given string as a (possibly repeating) comment to the given address.
     does not add the comment if it already exists.
     adds the comment on its own line.
 
     Args:
-      ea (int): the address at which to add the comment.
-      s (str): the comment text.
-      repeatable (bool): if True, set a repeatable comment.
+      ea: the address at which to add the comment.
+      s: the comment text.
+      repeatable: if True, set a repeatable comment.
 
-    Raises:
-      UnicodeEncodeError: if the given string is not ascii.
-    '''
+    """
     # see: http://blogs.norman.com/2011/security-research/improving-ida-analysis-of-x64-exception-handling
 
-    s = s.encode('ascii')
-
     if repeatable:
-        string = idc.RptCmt(ea)
+        cmt = idc.get_cmt(ea, True)
     else:
-        string = idc.Comment(ea)
+        cmt = idc.get_cmt(ea, False)
 
-    if not string:
-        string = s  # no existing comment
+    if not cmt:
+        cmt = s  # no existing comment
     else:
-        if s in string:  # ignore duplicates
+        if s in cmt:  # ignore duplicates
             return
-        string = string + "\\n" + s
+        cmt = cmt + "\n" + s
 
     if repeatable:
-        idc.MakeRptCmt(ea, string)
+        idc.set_cmt(ea, cmt, True)
     else:
-        idc.MakeComm(ea, string)
+        idc.set_cmt(ea, cmt, False)
 
 
-def append_lvar_comment(fva, frame_offset, s, repeatable=False):
-    '''
+def append_lvar_comment(fva: int, frame_offset: int, s: str, repeatable: bool = False) -> None:
+    """
     add the given string as a (possibly repeatable) stack variable comment to the given function.
     does not add the comment if it already exists.
     adds the comment on its own line.
 
     Args:
-      fva (int): the address of the function with the stack variable.
-      frame_offset (int): the offset into the stack frame at which the variable is found.
-      s (str): the comment text.
-      repeatable (bool): if True, set a repeatable comment.
+      fva: the address of the function with the stack variable.
+      frame_offset: the offset into the stack frame at which the variable is found.
+      s: the comment text.
+      repeatable: if True, set a repeatable comment.
 
-    Raises:
-      UnicodeEncodeError: if the given string is not ascii.
-    '''
-    s = s.encode('ascii')
+    """
 
-    stack = idc.GetFrame(fva)
+    stack = idc.get_func_attr(fva, idc.FUNCATTR_FRAME)
     if not stack:
-        raise RuntimeError('failed to find stack frame for function: ' + hex(fva))
+        raise RuntimeError("failed to find stack frame for function: 0x%x" % fva)
 
-    lvar_offset = idc.GetFrameLvarSize(fva) - frame_offset
+    lvar_offset = (
+        idc.get_func_attr(fva, idc.FUNCATTR_FRSIZE) - frame_offset
+    )  # alternative: idc.get_frame_lvar_size(fva) - frame_offset
     if not lvar_offset:
-        raise RuntimeError('failed to compute local variable offset')
+        raise RuntimeError("failed to compute local variable offset: 0x%x 0x%x %s" % (fva, stack, s))
 
     if lvar_offset <= 0:
-        raise RuntimeError('failed to compute positive local variable offset')
+        raise RuntimeError("failed to compute positive local variable offset: 0x%x 0x%x %s" % (fva, stack, s))
 
-    string = idc.GetMemberComment(stack, lvar_offset, repeatable)
+    string = idc.get_member_cmt(stack, lvar_offset, repeatable)
     if not string:
         string = s
     else:
         if s in string:  # ignore duplicates
             return
-        string = string + "\\n" + s
+        string = string + "\n" + s
 
-    if not idc.SetMemberComment(stack, lvar_offset, string, repeatable):
-        raise RuntimeError('failed to set comment')
+    if not idc.set_member_cmt(stack, lvar_offset, string, repeatable):
+        raise RuntimeError("failed to set comment: 0x%08x 0x%08x 0x%08x: %s" % (fva, stack, lvar_offset, s))
 
 
-def apply_decoded_strings(decoded_strings):
+def apply_decoded_strings(decoded_strings: List[DecodedString]) -> None:
     for ds in decoded_strings:
-        if not ds.s:
+        if not ds.string:
             continue
 
-        try:
-            if ds.characteristics["location_type"] == floss.decoding_manager.LocationType.GLOBAL:
-                logger.info('decoded string located at global address 0x%s: %s', ds.va, ds.s)
-                append_comment(ds.va, ds.s)
-            else:
-                logger.info('decoded string at global address 0x%s: %s', ds.va, ds.decoded_at_va)
-                append_comment(ds.decoded_at_va, ds.s)
-        except UnicodeEncodeError:
-            logger.info('failed to apply non-ascii comment: %s', ds.s)
-            continue
-
-
-def apply_stack_strings(stack_strings):
-    for ss in stack_strings:
-        if not ss.s:
-            continue
-
-        try:
-            append_lvar_comment(ss.fva, ss.frame_offset, ss.s)
-        except RuntimeError as e:
-            logger.info('failed to apply stack string: %s', str(e))
-            continue
-        except UnicodeEncodeError:
-            logger.info('failed to apply non-ascii comment: %s', ss.s)
-            continue
+        if ds.address_type == AddressType.GLOBAL:
+            logger.info("decoded string at global address 0x%x: %s", ds.address, ds.string)
+            append_comment(ds.address, ds.string)
         else:
-            logger.info('decoded stack string in function 0x%x: %s', ss.fva, ss.s)
+            logger.info("decoded string for function call at 0x%x: %s", ds.decoded_at, ds.string)
+            append_comment(ds.decoded_at, ds.string)
+
+
+def apply_stack_strings(
+    stack_strings: List[StackString], tight_strings: List[TightString], lvar_cmt: bool = True, cmt: bool = True
+) -> None:
+    """
+    lvar_cmt: apply stack variable comment
+    cmt: apply regular comment
+    """
+    strings = stack_strings + tight_strings
+    for s in strings:
+        if not s.string:
+            continue
+
+        logger.info(
+            "decoded stack/tight string in function 0x%x (pc: 0x%x): %s", s.function, s.program_counter, s.string
+        )
+        if lvar_cmt:
+            try:
+                # TODO this often fails due to wrong frame offset
+                append_lvar_comment(s.function, s.frame_offset, s.string)
+            except RuntimeError as e:
+                logger.warning("failed to apply stack/tight string: %s", str(e))
+        if cmt:
+            append_comment(s.program_counter, s.string)
 
 
 def ignore_floss_logs():
-    # ignore messages like:
-    # WARNING:EmulatorDriver:error during emulation of function: BreakpointHit at 0x1001fbfb
-    # ERROR:EmulatorDriver:error during emulation of function ... DivideByZero: DivideByZero at 0x10004940
-    # TODO: probably should modify emulator driver to de-prioritize this
-    logging.getLogger("EmulatorDriver").setLevel(logging.CRITICAL)
-
-    # ignore messages like:
-    # WARNING:Monitor:logAnomaly: anomaly: BreakpointHit at 0x1001fbfb
-    logging.getLogger("Monitor").setLevel(logging.ERROR)
-
-    # ignore messages like:
-    # WARNING:envi/codeflow.addCodeFlow:parseOpcode error at 0x1001044c: InvalidInstruction("'660f3a0fd90c660f7f1f660f6fe0660f' at 0x1001044c",)
-    logging.getLogger("envi/codeflow.addCodeFlow").setLevel(logging.ERROR)
-
-    # ignore messages like:
-    # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\symsrv.dll: [Error 126] The specified module could not be found
-    # WARNING:vtrace.platforms.win32:LoadLibrary C:\Users\USERNA~1\AppData\Local\Temp\_MEI21~1\vtrace\platforms\windll\amd64\dbghelp.dll: [Error 126] The specified module could not be found
-    logging.getLogger('vtrace.platforms.win32').setLevel(logging.ERROR)
-
-    # ignore messages like:
-    # WARNING:plugins.arithmetic_plugin.XORPlugin:identify: Invalid instruction encountered in basic block, skipping: 0x4a0637
-    logging.getLogger("floss.plugins.arithmetic_plugin.XORPlugin").setLevel(logging.ERROR)
-    logging.getLogger("floss.plugins.arithmetic_plugin.ShiftPlugin").setLevel(logging.ERROR)
+    logging.getLogger("floss.api_hooks").setLevel(logging.WARNING)
+    logging.getLogger("floss.function_argument_getter").setLevel(logging.WARNING)
+    logging.getLogger("viv_utils").setLevel(logging.CRITICAL)
+    logging.getLogger("viv_utils.emulator_drivers").setLevel(logging.ERROR)
+    floss.utils.set_vivisect_log_level(logging.CRITICAL)
 
 
 def main(argv=None):
@@ -167,32 +168,61 @@ def main(argv=None):
     logging.getLogger().setLevel(logging.INFO)
     ignore_floss_logs()
 
-    logger.info('loading vivisect workspace...')
-    vw = viv_utils.loadWorkspaceFromIdb()
-    logger.info('loaded vivisect workspace')
+    idb_path = Path(idc.get_idb_path())
+    fpath = idb_path.with_suffix("")
+    viv_path = fpath.with_suffix(".viv")
+    if viv_path.exists():
+        logger.info("loading vivisect workspace from %r", str(viv_path))
+        vw = viv_utils.getWorkspace(str(viv_path))
+    else:
+        logger.info("loading vivisect workspace from IDB...")
+        vw = viv_utils.loadWorkspaceFromIdb()
+    logger.info("loaded vivisect workspace")
 
-    selected_functions = vw.getFunctions()
-    selected_plugins = floss.main.get_all_plugins()
+    selected_functions = set(vw.getFunctions())
 
     time0 = time.time()
 
     logger.info("identifying decoding functions...")
-    decoding_functions_candidates = floss.identification_manager.identify_decoding_functions(vw, selected_plugins, selected_functions)
-    for fva, score in decoding_functions_candidates.get_top_candidate_functions():
-        logger.info('possible decoding function: 0x%x  score: %.02f', fva, score)
-
-    logger.info("decoding strings...")
-    decoded_strings = floss.main.decode_strings(vw, decoding_functions_candidates, MIN_LENGTH, no_filter=True)
-    logger.info('decoded %d strings', len(decoded_strings))
+    decoding_function_features, library_functions = floss.identify.find_decoding_function_features(
+        vw, selected_functions, disable_progress=True
+    )
 
     logger.info("extracting stackstrings...")
-    stack_strings = floss.stackstrings.extract_stackstrings(vw, selected_functions, MIN_LENGTH, no_filter=True)
-    stack_strings = set(stack_strings)
-    logger.info('decoded %d stack strings', len(stack_strings))
+    selected_functions = floss.identify.get_functions_without_tightloops(decoding_function_features)
+    stack_strings = floss.stackstrings.extract_stackstrings(
+        vw, selected_functions, MIN_LENGTH, verbosity=floss.render.Verbosity.VERBOSE, disable_progress=True
+    )
+    logger.info("decoded %d stack strings", len(stack_strings))
 
+    logger.info("extracting tightstrings...")
+    tightloop_functions = floss.identify.get_functions_with_tightloops(decoding_function_features)
+    tight_strings = floss.tightstrings.extract_tightstrings(
+        vw,
+        tightloop_functions,
+        min_length=MIN_LENGTH,
+        verbosity=floss.render.Verbosity.VERBOSE,
+        disable_progress=True,
+    )
+    logger.info("decoded %d tight strings", len(tight_strings))
+
+    apply_stack_strings(stack_strings, tight_strings)
+
+    logger.info("decoding strings...")
+
+    top_functions = floss.identify.get_top_functions(decoding_function_features, 20)
+    fvas_to_emulate = floss.identify.get_function_fvas(top_functions)
+    fvas_tight_functions = floss.identify.get_tight_function_fvas(decoding_function_features)
+    fvas_to_emulate = floss.identify.append_unique(fvas_to_emulate, fvas_tight_functions)
+    decoded_strings = floss.string_decoder.decode_strings(
+        vw,
+        fvas_to_emulate,
+        MIN_LENGTH,
+        verbosity=floss.render.Verbosity.VERBOSE,
+        disable_progress=True,
+    )
+    logger.info("decoded %d strings", len(decoded_strings))
     apply_decoded_strings(decoded_strings)
-
-    apply_stack_strings(stack_strings)
 
     time1 = time.time()
     logger.debug("finished execution after %f seconds", (time1 - time0))

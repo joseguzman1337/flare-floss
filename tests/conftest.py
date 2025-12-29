@@ -1,46 +1,77 @@
-# Copyright (C) 2017 FireEye, Inc. All Rights Reserved.
+# Copyright 2017 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 import os
+from pathlib import Path
+
 import yaml
 import pytest
-
 import viv_utils
 
 import floss.main as floss_main
-import floss.identification_manager as im
 import floss.stackstrings as stackstrings
+import floss.tightstrings as tightstrings
+import floss.string_decoder as string_decoder
+from floss.const import MIN_STRING_LENGTH
+from floss.identify import (
+    get_function_fvas,
+    get_top_functions,
+    get_functions_with_tightloops,
+    find_decoding_function_features,
+    get_functions_without_tightloops,
+)
 
 
 def extract_strings(vw):
     """
     Deobfuscate strings from vivisect workspace
     """
-    decoding_functions_candidates = identify_decoding_functions(vw)
-    decoded_strings = floss_main.decode_strings(vw, decoding_functions_candidates, 4)
-    selected_functions = floss_main.select_functions(vw, None)
-    decoded_stackstrings = stackstrings.extract_stackstrings(vw, selected_functions, 4)
-    decoded_strings.extend(decoded_stackstrings)
-    return [ds.s for ds in decoded_strings]
+    top_functions, decoding_function_features = identify_decoding_functions(vw)
+
+    for s_decoded in string_decoder.decode_strings(
+        vw, get_function_fvas(top_functions), MIN_STRING_LENGTH, disable_progress=True
+    ):
+        yield s_decoded.string
+
+    no_tightloop_functions = get_functions_without_tightloops(decoding_function_features)
+    for s_stack in stackstrings.extract_stackstrings(
+        vw, no_tightloop_functions, MIN_STRING_LENGTH, disable_progress=True
+    ):
+        yield s_stack.string
+
+    tightloop_functions = get_functions_with_tightloops(decoding_function_features)
+    for s_tight in tightstrings.extract_tightstrings(vw, tightloop_functions, MIN_STRING_LENGTH, disable_progress=True):
+        yield s_tight.string
 
 
 def identify_decoding_functions(vw):
     selected_functions = floss_main.select_functions(vw, None)
-    selected_plugin_names = floss_main.select_plugins(None)
-    selected_plugins = filter(lambda p: str(p) in selected_plugin_names, floss_main.get_all_plugins())
-    decoding_functions_candidates = im.identify_decoding_functions(vw, selected_plugins, selected_functions)
-    return decoding_functions_candidates
+    decoding_function_features, _ = find_decoding_function_features(vw, selected_functions, disable_progress=True)
+    top_functions = get_top_functions(decoding_function_features, 20)
+    return top_functions, decoding_function_features
 
 
-def pytest_collect_file(parent, path):
-    if path.basename == "test.yml":
-        return YamlFile(path, parent)
+def pytest_collect_file(parent, file_path):
+    if file_path.name == "test.yml":
+        return YamlFile.from_parent(parent, path=file_path)
 
 
 class YamlFile(pytest.File):
-
     def collect(self):
-        spec = yaml.safe_load(self.fspath.open())
-        test_dir = os.path.dirname(str(self.fspath))
+        spec = yaml.safe_load(self.path.open())
+        test_dir = self.path.parent
         for platform, archs in spec["Output Files"].items():
             for arch, filename in archs.items():
                 # TODO specify max runtime via command line option
@@ -55,13 +86,14 @@ class YamlFile(pytest.File):
                     pass
                 except ValueError:
                     pass
-                filepath = os.path.join(test_dir, filename)
-                if os.path.exists(filepath):
-                    yield FLOSSTest(self, platform, arch, filename, spec)
+                filepath = test_dir / filename
+                if filepath.exists():
+                    yield FLOSSTest.from_parent(
+                        self, path=str(filepath), platform=platform, arch=arch, filename=filename, spec=spec
+                    )
 
 
 class FLOSSTestError(Exception):
-
     def __init__(self, expected, got):
         self.expected = expected
         self.got = got
@@ -76,13 +108,9 @@ class FLOSSDecodingFunctionNotFound(Exception):
 
 
 class FLOSSTest(pytest.Item):
-
-    def __init__(self, path, platform, arch, filename, spec):
-        name = "{name:s}::{platform:s}::{arch:s}".format(
-            name=spec["Test Name"],
-            platform=platform,
-            arch=arch)
-        super(FLOSSTest, self).__init__(name, path)
+    def __init__(self, parent, path, platform, arch, filename, spec):
+        name = "{name:s}::{platform:s}::{arch:s}".format(name=spec["Test Name"], platform=platform, arch=arch)
+        super(FLOSSTest, self).__init__(name, parent)
         self.spec = spec
         self.platform = platform
         self.arch = arch
@@ -93,13 +121,12 @@ class FLOSSTest(pytest.Item):
         if not expected_strings:
             return
 
-        test_shellcode = self.spec.get("Test shellcode")
-        if test_shellcode:
-            with open(test_path, "rb") as f:
-                shellcode_data = f.read()
-            vw = viv_utils.getShellcodeWorkspace(shellcode_data)  # TODO provide arch from test.yml
+        arch = self.spec.get("Shellcode Architecture")
+        if arch in ("i386", "amd64"):
+            vw = viv_utils.getShellcodeWorkspaceFromFile(test_path, arch)
             found_strings = set(extract_strings(vw))
         else:
+            # default assumes pe
             vw = viv_utils.getWorkspace(test_path)
             found_strings = set(extract_strings(vw))
 
@@ -116,8 +143,8 @@ class FLOSSTest(pytest.Item):
             return
 
         vw = viv_utils.getWorkspace(test_path)
-        fs = map(lambda p: p[0], identify_decoding_functions(vw).get_top_candidate_functions())
-        found_functions = set(fs)
+        top_functions, _ = identify_decoding_functions(vw)
+        found_functions = set(top_functions)
 
         if not (expected_functions <= found_functions):
             raise FLOSSDecodingFunctionNotFound(expected_functions, found_functions)
@@ -130,24 +157,26 @@ class FLOSSTest(pytest.Item):
         if "{0.platform:s}-{0.arch:s}".format(self) in xfail:
             pytest.xfail("unsupported platform&arch test case (known issue)")
 
-        spec_path = self.location[0]
-        test_dir = os.path.dirname(spec_path)
-        test_path = os.path.join(test_dir, self.filename)
+        spec_path = Path(self.location[0])
+        test_dir = spec_path.parent
+        test_path = test_dir / self.filename
 
-        self._test_detection(test_path)
-        self._test_strings(test_path)
+        self._test_detection(str(test_path))
+        self._test_strings(str(test_path))
 
     def reportinfo(self):
-        return self.fspath, 0, "usecase: %s" % self.name
+        return self.path, 0, "usecase: %s" % self.name
 
-    def repr_failure(self, excinfo):
+    def repr_failure(self, excinfo):  # type: ignore [override]
         if isinstance(excinfo.value, FLOSSStringsNotExtracted):
             expected = excinfo.value.expected
             got = excinfo.value.got
-            return "\n".join([
-                "FLOSS extraction failed:",
-                "   expected: %s" % str(expected),
-                "   got: %s" % str(got),
-                "   expected-got: %s" % str(set(expected) - set(got)),
-                "   got-expected: %s" % str(set(got) - set(expected)),
-            ])
+            return "\n".join(
+                [
+                    "FLOSS extraction failed:",
+                    "   expected: %s" % str(expected),
+                    "   got: %s" % str(got),
+                    "   missing (expected-got): %s" % str(set(expected) - set(got)),
+                    "   unexpected (got-expected): %s" % str(set(got) - set(expected)),
+                ]
+            )
