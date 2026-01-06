@@ -6,30 +6,27 @@ __pycache__/
 
 # C extensions
 *.so
-
 # Distribution / packaging
 build/
 dist/
 floss.egg-info/
 lib/
 .cache
-
 # Pyenv file
 .python-version
 .venv
-
 # Test executables
 bin/
-
 # PyCharm
 .idea
 venv
 flare_floss.egg-info
 .eggs
-
-
 # vscode
 .vscode
 .direnv/
 .env/
 .envrc
+# macOS system files
+.DS_Store
+._*
